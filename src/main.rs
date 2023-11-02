@@ -32,6 +32,20 @@ fn decode_bencoded_value(encoded_value: &str) -> Value {
                 rest = &rest[1..]; // skip 'e'
                 (Value::Array(values), rest)
             }
+            'd' => {
+                // Example: "d3:foo3:bar5:helloi52ee" -> {"foo":"bar","hello":52}
+                let mut pairs = Vec::new();
+                let mut rest = &encoded_value[1..]; // skip 'd'
+                while !rest.starts_with('e') {
+                    let (key, new_rest) = inner(rest);
+                    let Value::String(key) = key else { panic!() };
+                    let (value, new_rest) = inner(new_rest);
+                    pairs.push((key, value));
+                    rest = new_rest;
+                }
+                rest = &rest[1..]; // skip 'e'
+                (Value::Object(pairs.into_iter().collect()), rest)
+            }
             _ => panic!("Unhandled encoded value: {}", encoded_value),
         }
     }
