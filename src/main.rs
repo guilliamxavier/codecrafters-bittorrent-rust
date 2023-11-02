@@ -5,12 +5,18 @@ use std::env;
 // use serde_bencode
 
 fn decode_bencoded_value(encoded_value: &str) -> Value {
-    if encoded_value.chars().next().unwrap().is_ascii_digit() {
+    let first_char = encoded_value.chars().next().unwrap();
+    if first_char.is_ascii_digit() {
         // Example: "5:hello" -> "hello"
         let (len, rest) = encoded_value.split_once(':').unwrap();
         let len = len.parse::<usize>().unwrap();
         let string = &rest[..len];
         Value::String(string.into())
+    } else if first_char == 'i' {
+        // Example: "i52e" -> 52
+        let (number, _) = encoded_value[1..].split_once('e').unwrap();
+        let number = number.parse::<i64>().unwrap();
+        Value::Number(number.into())
     } else {
         panic!("Unhandled encoded value: {}", encoded_value)
     }
