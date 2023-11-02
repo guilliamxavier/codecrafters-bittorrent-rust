@@ -1,5 +1,6 @@
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha1::{Digest, Sha1};
 use std::path::Path;
 use std::{env, fs};
 
@@ -61,7 +62,7 @@ struct Torrent {
     info: TorrentInfo,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 struct TorrentInfo {
     length: usize,
 
@@ -78,6 +79,11 @@ impl Torrent {
     fn parse_file(path: impl AsRef<Path>) -> anyhow::Result<Self> {
         let contents = fs::read(path)?;
         serde_bencode::from_bytes(&contents).map_err(Into::into)
+    }
+
+    fn info_hash(&self) -> [u8; 20] {
+        let encoded_info = serde_bencode::to_bytes(&self.info).unwrap();
+        Sha1::digest(encoded_info).into()
     }
 }
 
@@ -97,6 +103,7 @@ fn main() {
             let torrent = Torrent::parse_file(torrent_path).unwrap();
             println!("Tracker URL: {}", torrent.announce);
             println!("Length: {}", torrent.info.length);
+            println!("Info Hash: {}", hex::encode(torrent.info_hash()));
         }
         _ => println!("unknown command: {}", command),
     }
