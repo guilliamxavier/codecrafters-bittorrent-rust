@@ -1,4 +1,4 @@
-use serde::{Deserialize, Serialize};
+use serde::{de, Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
 use sha1::{Digest, Sha1};
 use std::path::Path;
@@ -55,6 +55,10 @@ fn decode_bencoded_value(encoded_value: &str) -> Value {
     decoded_value
 }
 
+const SHA1_LEN: usize = 20;
+
+type Sha1Bytes = [u8; SHA1_LEN];
+
 #[derive(Deserialize)]
 struct Torrent {
     announce: String,
@@ -72,7 +76,49 @@ struct TorrentInfo {
     piece_length: usize,
 
     #[serde(with = "serde_bytes")]
-    pieces: Vec<u8>,
+    pieces: TorrentInfoPieces,
+}
+
+struct TorrentInfoPieces(Vec<Sha1Bytes>);
+
+impl<'de> serde_bytes::Deserialize<'de> for TorrentInfoPieces {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let bytes: Vec<u8> = serde_bytes::Deserialize::deserialize(deserializer)?;
+
+        if bytes.len() % SHA1_LEN != 0 {
+            return Err(de::Error::custom("bad length"));
+        }
+        let byte_arrays = bytes
+            // `array_chunks` is unstable
+            .chunks_exact(SHA1_LEN)
+            .map(|chunk| chunk.try_into().unwrap())
+            .collect();
+
+        Ok(Self(byte_arrays))
+    }
+}
+
+impl serde_bytes::Serialize for TorrentInfoPieces {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let byte_arrays = &self.0;
+
+        // `slice_flatten` is unstable
+        fn flatten<const N: usize>(byte_arrays: &[[u8; N]]) -> &[u8] {
+            // cannot overflow because `byte_arrays` is already in the address space
+            let len = byte_arrays.len() * N;
+            // SAFETY: `[T]` is layout-identical to `[T; N]`
+            unsafe { std::slice::from_raw_parts(byte_arrays.as_ptr().cast(), len) }
+        }
+        let bytes = flatten(byte_arrays);
+
+        serde_bytes::Serialize::serialize(bytes, serializer)
+    }
 }
 
 impl Torrent {
@@ -81,7 +127,7 @@ impl Torrent {
         serde_bencode::from_bytes(&contents).map_err(Into::into)
     }
 
-    fn info_hash(&self) -> [u8; 20] {
+    fn info_hash(&self) -> Sha1Bytes {
         let encoded_info = serde_bencode::to_bytes(&self.info).unwrap();
         Sha1::digest(encoded_info).into()
     }
@@ -104,6 +150,11 @@ fn main() {
             println!("Tracker URL: {}", torrent.announce);
             println!("Length: {}", torrent.info.length);
             println!("Info Hash: {}", hex::encode(torrent.info_hash()));
+            println!("Piece Length: {}", torrent.info.piece_length);
+            println!("Piece Hashes:");
+            for piece_hash in &torrent.info.pieces.0 {
+                println!("{}", hex::encode(piece_hash));
+            }
         }
         _ => println!("unknown command: {}", command),
     }
