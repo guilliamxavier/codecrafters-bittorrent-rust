@@ -1,6 +1,9 @@
+use reqwest::{blocking, Url};
 use serde::{de, Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
 use sha1::{Digest, Sha1};
+use std::fmt::Write;
+use std::net::SocketAddrV4;
 use std::path::Path;
 use std::{env, fs};
 
@@ -131,6 +134,90 @@ impl Torrent {
         let encoded_info = serde_bencode::to_bytes(&self.info).unwrap();
         Sha1::digest(encoded_info).into()
     }
+
+    fn discover_peers(&self) -> anyhow::Result<TrackerResponse> {
+        let request = TrackerRequest {
+            info_hash: self.info_hash(),
+            peer_id: "00112233445566778899".into(),
+            port: 6881,
+            uploaded: 0,
+            downloaded: 0,
+            left: self.info.length,
+            compact: 1,
+        };
+        let mut url = Url::parse(&self.announce)?;
+        let mut query = serde_urlencoded::to_string(&request)?;
+        query.push_str("&info_hash=");
+        for b in &request.info_hash {
+            write!(&mut query, "%{:02X}", *b)?;
+        }
+        url.set_query(Some(&query));
+
+        let response = blocking::get(url)?;
+        let response = response.bytes()?;
+        let response: TrackerResponse = serde_bencode::from_bytes(&response)?;
+
+        Ok(response)
+    }
+}
+
+#[derive(Serialize)]
+struct TrackerRequest {
+    #[serde(skip)] // sadly enough, serde_urlencoded doesn't support raw bytes (only UTF-8 strings)
+    info_hash: Sha1Bytes,
+
+    peer_id: String,
+
+    port: u16,
+
+    uploaded: usize,
+
+    downloaded: usize,
+
+    left: usize,
+
+    compact: u8,
+}
+
+#[derive(Deserialize)]
+struct TrackerResponse {
+    #[allow(dead_code)]
+    interval: usize,
+
+    #[serde(with = "serde_bytes")]
+    peers: TrackerResponsePeers,
+}
+
+struct TrackerResponsePeers(Vec<SocketAddrV4>);
+
+impl<'de> serde_bytes::Deserialize<'de> for TrackerResponsePeers {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let bytes: Vec<u8> = serde_bytes::Deserialize::deserialize(deserializer)?;
+
+        const IP_LEN: usize = 4;
+        const PORT_LEN: usize = 2;
+        const CHUNK_LEN: usize = IP_LEN + PORT_LEN;
+        if bytes.len() % CHUNK_LEN != 0 {
+            return Err(de::Error::custom("bad length"));
+        }
+        let socket_addrs = bytes
+            // `array_chunks` is unstable
+            .chunks_exact(CHUNK_LEN)
+            .map(|chunk| {
+                let chunk: [u8; CHUNK_LEN] = chunk.try_into().unwrap();
+                // `split_array` is unstable
+                let (ip, port) = chunk.split_at(IP_LEN);
+                let ip: [u8; IP_LEN] = ip.try_into().unwrap();
+                let port: [u8; PORT_LEN] = port.try_into().unwrap();
+                SocketAddrV4::new(ip.into(), u16::from_be_bytes(port))
+            })
+            .collect();
+
+        Ok(Self(socket_addrs))
+    }
 }
 
 // Usage: your_bittorrent.sh decode "<encoded_value>"
@@ -154,6 +241,14 @@ fn main() {
             println!("Piece Hashes:");
             for piece_hash in &torrent.info.pieces.0 {
                 println!("{}", hex::encode(piece_hash));
+            }
+        }
+        "peers" => {
+            let torrent_path = &args[2];
+            let torrent = Torrent::parse_file(torrent_path).unwrap();
+            let tracker_response = torrent.discover_peers().unwrap();
+            for peer_addr in &tracker_response.peers.0 {
+                println!("{}", peer_addr);
             }
         }
         _ => println!("unknown command: {}", command),
