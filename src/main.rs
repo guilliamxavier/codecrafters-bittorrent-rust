@@ -3,10 +3,11 @@ use reqwest::{blocking, Url};
 use serde::{de, Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
 use sha1::{Digest, Sha1};
-use std::fmt::Write;
-use std::fs;
-use std::net::SocketAddrV4;
+use std::fmt::Write as _;
+use std::io::{Read, Write};
+use std::net::{SocketAddrV4, TcpStream};
 use std::path::{Path, PathBuf};
+use std::{fs, mem};
 
 // This function doesn't support raw bytes (only UTF-8 strings)
 fn decode_bencoded_value(encoded_value: &str) -> Value {
@@ -126,6 +127,8 @@ impl serde_bytes::Serialize for TorrentInfoPieces {
 }
 
 impl Torrent {
+    const LOCAL_PEER_ID: &'static str = "00112233445566778899";
+
     fn parse_file(path: impl AsRef<Path>) -> anyhow::Result<Self> {
         let contents = fs::read(path)?;
         serde_bencode::from_bytes(&contents).map_err(Into::into)
@@ -139,7 +142,7 @@ impl Torrent {
     fn discover_peers(&self) -> anyhow::Result<TrackerResponse> {
         let request = TrackerRequest {
             info_hash: self.info_hash(),
-            peer_id: "00112233445566778899".into(),
+            peer_id: Self::LOCAL_PEER_ID.into(),
             port: 6881,
             uploaded: 0,
             downloaded: 0,
@@ -159,6 +162,31 @@ impl Torrent {
         let response: TrackerResponse = serde_bencode::from_bytes(&response)?;
 
         Ok(response)
+    }
+
+    fn handshake_peer(&self, peer_addr: SocketAddrV4) -> anyhow::Result<Handshake> {
+        let mut tcp_stream = TcpStream::connect(peer_addr)?;
+
+        let pstr = b"BitTorrent protocol";
+        let ping = Handshake {
+            pstrlen: pstr.len().try_into().unwrap(),
+            pstr: *pstr,
+            reserved: [0; 8],
+            info_hash: self.info_hash(),
+            peer_id: Self::LOCAL_PEER_ID.as_bytes().try_into().unwrap(),
+        };
+        tcp_stream.write_all(ping.as_bytes())?;
+
+        let mut pong = Handshake::default_bytes();
+        tcp_stream.read_exact(&mut pong)?;
+        let pong = Handshake::from_bytes(pong);
+
+        assert_eq!(pong.pstrlen, ping.pstrlen);
+        assert_eq!(pong.pstr, ping.pstr);
+        // assert_eq!(pong.reserved, ping.reserved);
+        assert_eq!(pong.info_hash, ping.info_hash);
+
+        Ok(pong)
     }
 }
 
@@ -221,6 +249,35 @@ impl<'de> serde_bytes::Deserialize<'de> for TrackerResponsePeers {
     }
 }
 
+#[repr(C, packed)]
+struct Handshake {
+    pstrlen: u8,
+    pstr: [u8; 19],
+    reserved: [u8; 8],
+    info_hash: Sha1Bytes,
+    peer_id: [u8; 20],
+}
+
+type HandshakeAsBytes = [u8; mem::size_of::<Handshake>()];
+
+impl Handshake {
+    fn as_bytes(&self) -> &HandshakeAsBytes {
+        let this: *const _ = self;
+        let that = this.cast();
+        // SAFETY: `Handshake` has the same layout as `[u8; size_of::<Handshake>()]`
+        unsafe { &*that }
+    }
+
+    fn default_bytes() -> HandshakeAsBytes {
+        [0; mem::size_of::<Self>()]
+    }
+
+    fn from_bytes(bytes: HandshakeAsBytes) -> Self {
+        // SAFETY: sound because we transmute two types with the same layout
+        unsafe { mem::transmute(bytes) }
+    }
+}
+
 #[derive(Parser)]
 struct Cli {
     #[command(subcommand)]
@@ -229,9 +286,19 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    Decode { encoded_value: String },
-    Info { torrent_path: PathBuf },
-    Peers { torrent_path: PathBuf },
+    Decode {
+        encoded_value: String,
+    },
+    Info {
+        torrent_path: PathBuf,
+    },
+    Peers {
+        torrent_path: PathBuf,
+    },
+    Handshake {
+        torrent_path: PathBuf,
+        peer_addr: SocketAddrV4,
+    },
 }
 
 fn main() {
@@ -259,6 +326,14 @@ fn main() {
             for peer_addr in &tracker_response.peers.0 {
                 println!("{}", peer_addr);
             }
+        }
+        Commands::Handshake {
+            torrent_path,
+            peer_addr,
+        } => {
+            let torrent = Torrent::parse_file(torrent_path).unwrap();
+            let pong = torrent.handshake_peer(peer_addr).unwrap();
+            println!("Peer ID: {}", hex::encode(pong.peer_id));
         }
     }
 }
