@@ -1,11 +1,12 @@
+use clap::{Parser, Subcommand};
 use reqwest::{blocking, Url};
 use serde::{de, Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
 use sha1::{Digest, Sha1};
 use std::fmt::Write;
+use std::fs;
 use std::net::SocketAddrV4;
-use std::path::Path;
-use std::{env, fs};
+use std::path::{Path, PathBuf};
 
 // This function doesn't support raw bytes (only UTF-8 strings)
 fn decode_bencoded_value(encoded_value: &str) -> Value {
@@ -220,19 +221,28 @@ impl<'de> serde_bytes::Deserialize<'de> for TrackerResponsePeers {
     }
 }
 
-// Usage: your_bittorrent.sh decode "<encoded_value>"
-fn main() {
-    let args: Vec<String> = env::args().collect();
-    let command = &args[1];
+#[derive(Parser)]
+struct Cli {
+    #[command(subcommand)]
+    command: Commands,
+}
 
-    match command.as_str() {
-        "decode" => {
-            let encoded_value = &args[2];
-            let decoded_value = decode_bencoded_value(encoded_value);
+#[derive(Subcommand)]
+enum Commands {
+    Decode { encoded_value: String },
+    Info { torrent_path: PathBuf },
+    Peers { torrent_path: PathBuf },
+}
+
+fn main() {
+    let cli = Cli::parse();
+
+    match cli.command {
+        Commands::Decode { encoded_value } => {
+            let decoded_value = decode_bencoded_value(&encoded_value);
             println!("{}", decoded_value);
         }
-        "info" => {
-            let torrent_path = &args[2];
+        Commands::Info { torrent_path } => {
             let torrent = Torrent::parse_file(torrent_path).unwrap();
             println!("Tracker URL: {}", torrent.announce);
             println!("Length: {}", torrent.info.length);
@@ -243,14 +253,12 @@ fn main() {
                 println!("{}", hex::encode(piece_hash));
             }
         }
-        "peers" => {
-            let torrent_path = &args[2];
+        Commands::Peers { torrent_path } => {
             let torrent = Torrent::parse_file(torrent_path).unwrap();
             let tracker_response = torrent.discover_peers().unwrap();
             for peer_addr in &tracker_response.peers.0 {
                 println!("{}", peer_addr);
             }
         }
-        _ => println!("unknown command: {}", command),
     }
 }
