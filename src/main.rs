@@ -1,3 +1,4 @@
+use anyhow::anyhow;
 use clap::{Parser, Subcommand};
 use reqwest::{blocking, Url};
 use serde::{de, Deserialize, Deserializer, Serialize, Serializer};
@@ -7,7 +8,7 @@ use std::fmt::Write as _;
 use std::io::{Read, Write};
 use std::net::{SocketAddrV4, TcpStream};
 use std::path::{Path, PathBuf};
-use std::{fs, mem};
+use std::{fs, mem, slice};
 
 // This function doesn't support raw bytes (only UTF-8 strings)
 fn decode_bencoded_value(encoded_value: &str) -> Value {
@@ -118,7 +119,7 @@ impl serde_bytes::Serialize for TorrentInfoPieces {
             // cannot overflow because `byte_arrays` is already in the address space
             let len = byte_arrays.len() * N;
             // SAFETY: `[T]` is layout-identical to `[T; N]`
-            unsafe { std::slice::from_raw_parts(byte_arrays.as_ptr().cast(), len) }
+            unsafe { slice::from_raw_parts(byte_arrays.as_ptr().cast(), len) }
         }
         let bytes = flatten(byte_arrays);
 
@@ -164,7 +165,10 @@ impl Torrent {
         Ok(response)
     }
 
-    fn handshake_peer(&self, peer_addr: SocketAddrV4) -> anyhow::Result<Handshake> {
+    fn handshake_peer(
+        &self,
+        peer_addr: SocketAddrV4,
+    ) -> anyhow::Result<(Handshake, PeerConnection<false>)> {
         let mut tcp_stream = TcpStream::connect(peer_addr)?;
 
         let pstr = b"BitTorrent protocol";
@@ -186,7 +190,15 @@ impl Torrent {
         // assert_eq!(pong.reserved, ping.reserved);
         assert_eq!(pong.info_hash, ping.info_hash);
 
-        Ok(pong)
+        let mut peer_conn = PeerConnection(tcp_stream);
+
+        let bitfield_message = peer_conn.recv()?;
+        let PeerMessage::Bitfield(_) = bitfield_message else {
+            return Err(anyhow!("expected Bitfield message, got {:?}", bitfield_message));
+        };
+        // The bitfield payload is ignored for this challenge, all peers have all pieces available.
+
+        Ok((pong, peer_conn))
     }
 }
 
@@ -278,6 +290,203 @@ impl Handshake {
     }
 }
 
+const BLOCK_LEN: usize = 1 << 14; // 16 KiB
+
+#[derive(Debug)]
+#[non_exhaustive]
+#[repr(u8)]
+enum PeerMessage {
+    Bitfield(Vec<u8>) = 5,
+    Interested = 2,
+    Unchoke = 1,
+    Request(PeerMessageRequest) = 6,
+    Piece(PeerMessagePiece) = 7,
+}
+
+#[derive(Debug, Copy, Clone)]
+struct PeerMessageRequest {
+    index: u32,
+    begin: u32,
+    length: u32,
+}
+
+#[derive(Debug, Default)]
+struct PeerMessagePiece {
+    index: u32,
+    begin: u32,
+    block: Vec<u8>,
+}
+
+impl PeerMessage {
+    fn id(&self) -> u8 {
+        let this: *const _ = self;
+        let that = this.cast();
+        // SAFETY: `PeerMessage` is a `repr(u8)` enum
+        unsafe { *that }
+    }
+}
+
+// I = interested
+struct PeerConnection<const I: bool>(TcpStream);
+
+impl<const I: bool> PeerConnection<I> {
+    const PAYLOAD_LEN_MAX: usize = 1 << 16; // 64 KiB
+
+    fn recv(&mut self) -> anyhow::Result<PeerMessage> {
+        let incoming = &mut self.0;
+
+        const U32_LEN: usize = 4;
+        fn read_u32(incoming: &mut TcpStream) -> anyhow::Result<u32> {
+            let mut buf = [0; U32_LEN];
+            incoming.read_exact(&mut buf)?;
+            Ok(u32::from_be_bytes(buf))
+        }
+        let len = read_u32(incoming)?;
+        if len == 0 {
+            return Err(anyhow!("zero length"));
+        }
+        let payload_len = len - 1;
+        let payload_len: usize = payload_len.try_into().unwrap();
+        if payload_len > Self::PAYLOAD_LEN_MAX {
+            return Err(anyhow!("length too large"));
+        }
+
+        let mut id = 0;
+        incoming.read_exact(slice::from_mut(&mut id))?;
+        match id {
+            x if x == PeerMessage::Bitfield(Vec::new()).id() => {
+                let mut payload = vec![0; payload_len];
+                incoming.read_exact(&mut payload)?;
+
+                Ok(PeerMessage::Bitfield(payload))
+            }
+            x if x == PeerMessage::Unchoke.id() => {
+                if payload_len != 0 {
+                    return Err(anyhow!("unexpected payload"));
+                }
+
+                Ok(PeerMessage::Unchoke)
+            }
+            x if x == PeerMessage::Piece(PeerMessagePiece::default()).id() => {
+                let prefix_len = 2 * U32_LEN;
+                if payload_len < prefix_len {
+                    return Err(anyhow!("length too small"));
+                }
+                let block_len = payload_len - prefix_len;
+
+                let index = read_u32(incoming)?;
+                let begin = read_u32(incoming)?;
+
+                let mut block = vec![0; block_len];
+                incoming.read_exact(&mut block)?;
+
+                Ok(PeerMessage::Piece(PeerMessagePiece {
+                    index,
+                    begin,
+                    block,
+                }))
+            }
+            _ => Err(anyhow!("unhandled id {}", id)),
+        }
+    }
+
+    fn send(&mut self, message: &PeerMessage) -> anyhow::Result<()> {
+        let outgoing = &mut self.0;
+
+        let id = message.id();
+        let payload: Vec<u8> = match *message {
+            PeerMessage::Interested => Vec::new(),
+            PeerMessage::Request(request) => [
+                request.index.to_be_bytes(),
+                request.begin.to_be_bytes(),
+                request.length.to_be_bytes(),
+            ]
+            .concat(),
+
+            _ => return Err(anyhow!("unhandled message kind {:?}", message)),
+        };
+        let payload_len = payload.len();
+        assert!(payload_len <= Self::PAYLOAD_LEN_MAX);
+        let payload_len: u32 = payload_len.try_into().unwrap();
+        let len = payload_len + 1;
+
+        outgoing.write_all(&len.to_be_bytes())?;
+        outgoing.write_all(slice::from_ref(&id))?;
+        outgoing.write_all(&payload)?;
+
+        Ok(())
+    }
+}
+
+impl PeerConnection<false> {
+    fn send_interested(mut self) -> anyhow::Result<PeerConnection<true>> {
+        self.send(&PeerMessage::Interested)?;
+
+        let unchoke_message = self.recv()?;
+        let PeerMessage::Unchoke = unchoke_message else {
+            return Err(anyhow!("expected Unchoke message, got {:?}", unchoke_message));
+        };
+
+        Ok(PeerConnection(self.0))
+    }
+}
+
+impl PeerConnection<true> {
+    fn download_piece(&mut self, torrent: &Torrent, piece_index: usize) -> anyhow::Result<Vec<u8>> {
+        let piece_hash = torrent.info.pieces.0[piece_index];
+
+        fn compute_part_len(base: usize, index: usize, nb: usize, total: usize) -> usize {
+            assert!(nb > 0);
+            assert!(index < nb);
+            if index == nb - 1 {
+                assert_ne!(base, 0);
+                let rem = total % base;
+                if rem != 0 || total == 0 {
+                    return rem;
+                }
+            }
+            base
+        }
+        let piece_len = compute_part_len(
+            torrent.info.piece_length,
+            piece_index,
+            torrent.info.pieces.0.len(),
+            torrent.info.length,
+        );
+        // div_ceil: `int_roundings` is unstable
+        let nb_blocks = piece_len / BLOCK_LEN + usize::from(piece_len % BLOCK_LEN != 0);
+
+        let mut blocks_concat = Vec::with_capacity(piece_len);
+        for block_index in 0..nb_blocks {
+            let block_len = compute_part_len(BLOCK_LEN, block_index, nb_blocks, piece_len);
+            let request = PeerMessageRequest {
+                index: piece_index.try_into().unwrap(),
+                begin: (block_index * BLOCK_LEN).try_into().unwrap(),
+                length: block_len.try_into().unwrap(),
+            };
+            self.send(&PeerMessage::Request(request))?;
+
+            let piece_message = self.recv()?;
+            let PeerMessage::Piece(piece) = piece_message else {
+                return Err(anyhow!("expected Piece message, got {:?}", piece_message));
+            };
+            assert_eq!(piece.index, request.index);
+            assert_eq!(piece.begin, request.begin);
+            assert_eq!(piece.block.len(), block_len);
+
+            blocks_concat.extend(piece.block);
+        }
+
+        assert_eq!(blocks_concat.len(), piece_len);
+        let blocks_concat_hash: Sha1Bytes = Sha1::digest(&blocks_concat).into();
+        if blocks_concat_hash != piece_hash {
+            return Err(anyhow!("hashes differ"));
+        }
+
+        Ok(blocks_concat)
+    }
+}
+
 #[derive(Parser)]
 struct Cli {
     #[command(subcommand)]
@@ -285,6 +494,7 @@ struct Cli {
 }
 
 #[derive(Subcommand)]
+#[clap(rename_all = "snake_case")]
 enum Commands {
     Decode {
         encoded_value: String,
@@ -298,6 +508,13 @@ enum Commands {
     Handshake {
         torrent_path: PathBuf,
         peer_addr: SocketAddrV4,
+    },
+    DownloadPiece {
+        #[arg(short)]
+        output: PathBuf,
+
+        torrent_path: PathBuf,
+        piece_index: usize,
     },
 }
 
@@ -332,8 +549,22 @@ fn main() {
             peer_addr,
         } => {
             let torrent = Torrent::parse_file(torrent_path).unwrap();
-            let pong = torrent.handshake_peer(peer_addr).unwrap();
+            let (pong, _) = torrent.handshake_peer(peer_addr).unwrap();
             println!("Peer ID: {}", hex::encode(pong.peer_id));
+        }
+        Commands::DownloadPiece {
+            output,
+            torrent_path,
+            piece_index,
+        } => {
+            let torrent = Torrent::parse_file(torrent_path).unwrap();
+            let tracker_response = torrent.discover_peers().unwrap();
+            let peer_addr = tracker_response.peers.0[0];
+            let (_, peer_conn) = torrent.handshake_peer(peer_addr).unwrap();
+            let mut peer_conn = peer_conn.send_interested().unwrap();
+            let piece = peer_conn.download_piece(&torrent, piece_index).unwrap();
+            fs::write(&output, piece).unwrap();
+            println!("Piece {} downloaded to {}.", piece_index, output.display());
         }
     }
 }
