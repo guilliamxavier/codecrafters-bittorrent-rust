@@ -5,7 +5,8 @@ use serde::{de, Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
 use sha1::{Digest, Sha1};
 use std::fmt::Write as _;
-use std::io::{Read, Write};
+use std::fs::File;
+use std::io::{Read, Seek, Write};
 use std::net::{SocketAddrV4, TcpStream};
 use std::path::{Path, PathBuf};
 use std::{fs, mem, slice};
@@ -516,6 +517,12 @@ enum Commands {
         torrent_path: PathBuf,
         piece_index: usize,
     },
+    Download {
+        #[arg(short)]
+        output: PathBuf,
+
+        torrent_path: PathBuf,
+    },
 }
 
 fn main() {
@@ -565,6 +572,33 @@ fn main() {
             let piece = peer_conn.download_piece(&torrent, piece_index).unwrap();
             fs::write(&output, piece).unwrap();
             println!("Piece {} downloaded to {}.", piece_index, output.display());
+        }
+        Commands::Download {
+            output,
+            torrent_path,
+        } => {
+            let torrent = Torrent::parse_file(&torrent_path).unwrap();
+            let mut output_file = File::options()
+                .append(true)
+                .create(true)
+                // .truncate(true) // incompatible with append, done manually below
+                .open(&output)
+                .unwrap();
+            output_file.set_len(0).unwrap();
+            output_file.rewind().unwrap();
+            let tracker_response = torrent.discover_peers().unwrap();
+            let peer_addr = tracker_response.peers.0[0];
+            let (_, peer_conn) = torrent.handshake_peer(peer_addr).unwrap();
+            let mut peer_conn = peer_conn.send_interested().unwrap();
+            for piece_index in 0..torrent.info.pieces.0.len() {
+                let piece = peer_conn.download_piece(&torrent, piece_index).unwrap();
+                output_file.write_all(&piece).unwrap();
+            }
+            println!(
+                "Downloaded {} to {}.",
+                torrent_path.display(),
+                output.display()
+            );
         }
     }
 }
