@@ -1,15 +1,19 @@
 use anyhow::anyhow;
 use clap::{Parser, Subcommand};
-use reqwest::{blocking, Url};
+use reqwest::Url;
 use serde::{de, Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
 use sha1::{Digest, Sha1};
 use std::fmt::Write as _;
 use std::fs::File;
-use std::io::{Read, Seek, Write};
-use std::net::{SocketAddrV4, TcpStream};
+use std::io::{Seek, SeekFrom, Write};
+use std::net::SocketAddrV4;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use std::{fs, mem, slice};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpStream;
+use tokio::task::JoinSet;
 
 // This function doesn't support raw bytes (only UTF-8 strings)
 fn decode_bencoded_value(encoded_value: &str) -> Value {
@@ -71,6 +75,9 @@ struct Torrent {
     announce: String,
 
     info: TorrentInfo,
+
+    #[serde(skip)]
+    cached_info_hash: OnceLock<Sha1Bytes>,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -137,11 +144,13 @@ impl Torrent {
     }
 
     fn info_hash(&self) -> Sha1Bytes {
-        let encoded_info = serde_bencode::to_bytes(&self.info).unwrap();
-        Sha1::digest(encoded_info).into()
+        *self.cached_info_hash.get_or_init(|| {
+            let encoded_info = serde_bencode::to_bytes(&self.info).unwrap();
+            Sha1::digest(encoded_info).into()
+        })
     }
 
-    fn discover_peers(&self) -> anyhow::Result<TrackerResponse> {
+    async fn discover_peers(&self) -> anyhow::Result<TrackerResponse> {
         let request = TrackerRequest {
             info_hash: self.info_hash(),
             peer_id: Self::LOCAL_PEER_ID.into(),
@@ -159,18 +168,18 @@ impl Torrent {
         }
         url.set_query(Some(&query));
 
-        let response = blocking::get(url)?;
-        let response = response.bytes()?;
+        let response = reqwest::get(url).await?;
+        let response = response.bytes().await?;
         let response: TrackerResponse = serde_bencode::from_bytes(&response)?;
 
         Ok(response)
     }
 
-    fn handshake_peer(
+    async fn handshake_peer(
         &self,
         peer_addr: SocketAddrV4,
     ) -> anyhow::Result<(Handshake, PeerConnection<false>)> {
-        let mut tcp_stream = TcpStream::connect(peer_addr)?;
+        let mut tcp_stream = TcpStream::connect(peer_addr).await?;
 
         let pstr = b"BitTorrent protocol";
         let ping = Handshake {
@@ -180,10 +189,10 @@ impl Torrent {
             info_hash: self.info_hash(),
             peer_id: Self::LOCAL_PEER_ID.as_bytes().try_into().unwrap(),
         };
-        tcp_stream.write_all(ping.as_bytes())?;
+        tcp_stream.write_all(ping.as_bytes()).await?;
 
         let mut pong = Handshake::default_bytes();
-        tcp_stream.read_exact(&mut pong)?;
+        tcp_stream.read_exact(&mut pong).await?;
         let pong = Handshake::from_bytes(pong);
 
         assert_eq!(pong.pstrlen, ping.pstrlen);
@@ -193,7 +202,7 @@ impl Torrent {
 
         let mut peer_conn = PeerConnection(tcp_stream);
 
-        let bitfield_message = peer_conn.recv()?;
+        let bitfield_message = peer_conn.recv().await?;
         let PeerMessage::Bitfield(_) = bitfield_message else {
             return Err(anyhow!("expected Bitfield message, got {:?}", bitfield_message));
         };
@@ -333,16 +342,16 @@ struct PeerConnection<const I: bool>(TcpStream);
 impl<const I: bool> PeerConnection<I> {
     const PAYLOAD_LEN_MAX: usize = 1 << 16; // 64 KiB
 
-    fn recv(&mut self) -> anyhow::Result<PeerMessage> {
+    async fn recv(&mut self) -> anyhow::Result<PeerMessage> {
         let incoming = &mut self.0;
 
         const U32_LEN: usize = 4;
-        fn read_u32(incoming: &mut TcpStream) -> anyhow::Result<u32> {
+        async fn read_u32(incoming: &mut TcpStream) -> anyhow::Result<u32> {
             let mut buf = [0; U32_LEN];
-            incoming.read_exact(&mut buf)?;
+            incoming.read_exact(&mut buf).await?;
             Ok(u32::from_be_bytes(buf))
         }
-        let len = read_u32(incoming)?;
+        let len = read_u32(incoming).await?;
         if len == 0 {
             return Err(anyhow!("zero length"));
         }
@@ -353,11 +362,11 @@ impl<const I: bool> PeerConnection<I> {
         }
 
         let mut id = 0;
-        incoming.read_exact(slice::from_mut(&mut id))?;
+        incoming.read_exact(slice::from_mut(&mut id)).await?;
         match id {
             x if x == PeerMessage::Bitfield(Vec::new()).id() => {
                 let mut payload = vec![0; payload_len];
-                incoming.read_exact(&mut payload)?;
+                incoming.read_exact(&mut payload).await?;
 
                 Ok(PeerMessage::Bitfield(payload))
             }
@@ -375,11 +384,11 @@ impl<const I: bool> PeerConnection<I> {
                 }
                 let block_len = payload_len - prefix_len;
 
-                let index = read_u32(incoming)?;
-                let begin = read_u32(incoming)?;
+                let index = read_u32(incoming).await?;
+                let begin = read_u32(incoming).await?;
 
                 let mut block = vec![0; block_len];
-                incoming.read_exact(&mut block)?;
+                incoming.read_exact(&mut block).await?;
 
                 Ok(PeerMessage::Piece(PeerMessagePiece {
                     index,
@@ -391,7 +400,7 @@ impl<const I: bool> PeerConnection<I> {
         }
     }
 
-    fn send(&mut self, message: &PeerMessage) -> anyhow::Result<()> {
+    async fn send(&mut self, message: &PeerMessage) -> anyhow::Result<()> {
         let outgoing = &mut self.0;
 
         let id = message.id();
@@ -411,19 +420,19 @@ impl<const I: bool> PeerConnection<I> {
         let payload_len: u32 = payload_len.try_into().unwrap();
         let len = payload_len + 1;
 
-        outgoing.write_all(&len.to_be_bytes())?;
-        outgoing.write_all(slice::from_ref(&id))?;
-        outgoing.write_all(&payload)?;
+        outgoing.write_all(&len.to_be_bytes()).await?;
+        outgoing.write_all(slice::from_ref(&id)).await?;
+        outgoing.write_all(&payload).await?;
 
         Ok(())
     }
 }
 
 impl PeerConnection<false> {
-    fn send_interested(mut self) -> anyhow::Result<PeerConnection<true>> {
-        self.send(&PeerMessage::Interested)?;
+    async fn send_interested(mut self) -> anyhow::Result<PeerConnection<true>> {
+        self.send(&PeerMessage::Interested).await?;
 
-        let unchoke_message = self.recv()?;
+        let unchoke_message = self.recv().await?;
         let PeerMessage::Unchoke = unchoke_message else {
             return Err(anyhow!("expected Unchoke message, got {:?}", unchoke_message));
         };
@@ -433,14 +442,17 @@ impl PeerConnection<false> {
 }
 
 impl PeerConnection<true> {
-    fn download_piece(&mut self, torrent: &Torrent, piece_index: usize) -> anyhow::Result<Vec<u8>> {
+    async fn download_piece(
+        &mut self,
+        torrent: &Torrent,
+        piece_index: usize,
+    ) -> anyhow::Result<Vec<u8>> {
         let piece_hash = torrent.info.pieces.0[piece_index];
 
         fn compute_part_len(base: usize, index: usize, nb: usize, total: usize) -> usize {
             assert!(nb > 0);
             assert!(index < nb);
             if index == nb - 1 {
-                assert_ne!(base, 0);
                 let rem = total % base;
                 if rem != 0 || total == 0 {
                     return rem;
@@ -465,9 +477,9 @@ impl PeerConnection<true> {
                 begin: (block_index * BLOCK_LEN).try_into().unwrap(),
                 length: block_len.try_into().unwrap(),
             };
-            self.send(&PeerMessage::Request(request))?;
+            self.send(&PeerMessage::Request(request)).await?;
 
-            let piece_message = self.recv()?;
+            let piece_message = self.recv().await?;
             let PeerMessage::Piece(piece) = piece_message else {
                 return Err(anyhow!("expected Piece message, got {:?}", piece_message));
             };
@@ -525,7 +537,8 @@ enum Commands {
     },
 }
 
-fn main() {
+#[tokio::main]
+async fn main() {
     let cli = Cli::parse();
 
     match cli.command {
@@ -546,7 +559,7 @@ fn main() {
         }
         Commands::Peers { torrent_path } => {
             let torrent = Torrent::parse_file(torrent_path).unwrap();
-            let tracker_response = torrent.discover_peers().unwrap();
+            let tracker_response = torrent.discover_peers().await.unwrap();
             for peer_addr in &tracker_response.peers.0 {
                 println!("{}", peer_addr);
             }
@@ -556,7 +569,7 @@ fn main() {
             peer_addr,
         } => {
             let torrent = Torrent::parse_file(torrent_path).unwrap();
-            let (pong, _) = torrent.handshake_peer(peer_addr).unwrap();
+            let (pong, _) = torrent.handshake_peer(peer_addr).await.unwrap();
             println!("Peer ID: {}", hex::encode(pong.peer_id));
         }
         Commands::DownloadPiece {
@@ -565,11 +578,14 @@ fn main() {
             piece_index,
         } => {
             let torrent = Torrent::parse_file(torrent_path).unwrap();
-            let tracker_response = torrent.discover_peers().unwrap();
+            let tracker_response = torrent.discover_peers().await.unwrap();
             let peer_addr = tracker_response.peers.0[0];
-            let (_, peer_conn) = torrent.handshake_peer(peer_addr).unwrap();
-            let mut peer_conn = peer_conn.send_interested().unwrap();
-            let piece = peer_conn.download_piece(&torrent, piece_index).unwrap();
+            let (_, peer_conn) = torrent.handshake_peer(peer_addr).await.unwrap();
+            let mut peer_conn = peer_conn.send_interested().await.unwrap();
+            let piece = peer_conn
+                .download_piece(&torrent, piece_index)
+                .await
+                .unwrap();
             fs::write(&output, piece).unwrap();
             println!("Piece {} downloaded to {}.", piece_index, output.display());
         }
@@ -578,22 +594,53 @@ fn main() {
             torrent_path,
         } => {
             let torrent = Torrent::parse_file(&torrent_path).unwrap();
-            let mut output_file = File::options()
-                .append(true)
-                .create(true)
-                // .truncate(true) // incompatible with append, done manually below
-                .open(&output)
+
+            let output_file = File::create(&output).unwrap();
+            output_file
+                .set_len(torrent.info.length.try_into().unwrap())
                 .unwrap();
-            output_file.set_len(0).unwrap();
-            output_file.rewind().unwrap();
-            let tracker_response = torrent.discover_peers().unwrap();
-            let peer_addr = tracker_response.peers.0[0];
-            let (_, peer_conn) = torrent.handshake_peer(peer_addr).unwrap();
-            let mut peer_conn = peer_conn.send_interested().unwrap();
-            for piece_index in 0..torrent.info.pieces.0.len() {
-                let piece = peer_conn.download_piece(&torrent, piece_index).unwrap();
-                output_file.write_all(&piece).unwrap();
+
+            let tracker_response = torrent.discover_peers().await.unwrap();
+            let peer_addrs = tracker_response.peers.0;
+            assert!(!peer_addrs.is_empty());
+
+            let max_concurrent_tasks = 5;
+            let nb_pieces = torrent.info.pieces.0.len();
+            let nb_concurrent_tasks = nb_pieces.min(peer_addrs.len()).min(max_concurrent_tasks);
+
+            let mut tasks = JoinSet::new();
+            let torrent: &'static _ = Box::leak(Box::new(torrent));
+            for peer_addr in peer_addrs.into_iter().take(nb_concurrent_tasks) {
+                tasks.spawn(async move {
+                    let (_, peer_conn) = torrent.handshake_peer(peer_addr).await.unwrap();
+                    peer_conn.send_interested().await.unwrap()
+                });
             }
+
+            let mut output_file: &'static _ = Box::leak(Box::new(output_file));
+            for piece_index in 0..nb_pieces {
+                let task_result = tasks.join_next().await.unwrap();
+                let mut peer_conn = task_result.unwrap();
+                tasks.spawn(async move {
+                    let piece = peer_conn
+                        .download_piece(torrent, piece_index)
+                        .await
+                        .unwrap();
+                    output_file
+                        .seek(SeekFrom::Start(
+                            (piece_index * torrent.info.piece_length)
+                                .try_into()
+                                .unwrap(),
+                        ))
+                        .unwrap();
+                    output_file.write_all(&piece).unwrap();
+                    peer_conn
+                });
+            }
+            while let Some(task_result) = tasks.join_next().await {
+                task_result.unwrap();
+            }
+
             println!(
                 "Downloaded {} to {}.",
                 torrent_path.display(),
