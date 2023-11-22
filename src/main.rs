@@ -6,8 +6,8 @@ use serde_json::Value;
 use sha1::{Digest, Sha1};
 use std::fmt::Write as _;
 use std::fs::File;
-use std::io::{Seek, SeekFrom, Write};
 use std::net::SocketAddrV4;
+use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::{fs, mem, slice};
@@ -617,7 +617,7 @@ async fn main() {
                 });
             }
 
-            let mut output_file: &'static _ = Box::leak(Box::new(output_file));
+            let output_file: &'static _ = Box::leak(Box::new(output_file));
             for piece_index in 0..nb_pieces {
                 let task_result = tasks.join_next().await.unwrap();
                 let mut peer_conn = task_result.unwrap();
@@ -627,13 +627,13 @@ async fn main() {
                         .await
                         .unwrap();
                     output_file
-                        .seek(SeekFrom::Start(
+                        .write_all_at(
+                            &piece,
                             (piece_index * torrent.info.piece_length)
                                 .try_into()
                                 .unwrap(),
-                        ))
+                        )
                         .unwrap();
-                    output_file.write_all(&piece).unwrap();
                     peer_conn
                 });
             }
